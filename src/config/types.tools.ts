@@ -389,8 +389,8 @@ export type ToolsConfig = {
     search?: {
       /** Enable web search tool (default: true when API key is present). */
       enabled?: boolean;
-      /** Search provider ("brave", "perplexity", or "grok"). */
-      provider?: "brave" | "perplexity" | "grok" | "duckduckgo";
+      /** Search provider ("brave", "perplexity", "grok", "duckduckgo", "bing", or "chromium"). */
+      provider?: "brave" | "perplexity" | "grok" | "duckduckgo" | "bing" | "chromium";
       /** Brave Search API key (optional; defaults to BRAVE_API_KEY env var). */
       apiKey?: string;
       /** Default search results count (1-10). */
@@ -416,6 +416,11 @@ export type ToolsConfig = {
         model?: string;
         /** Include inline citations in response text as markdown links (default: false). */
         inlineCitations?: boolean;
+      };
+      /** Bing-specific configuration (used when provider="bing"). */
+      bing?: {
+        /** API key for Microsoft Bing (defaults to BING_API_KEY env var). */
+        apiKey?: string;
       };
     };
     fetch?: {

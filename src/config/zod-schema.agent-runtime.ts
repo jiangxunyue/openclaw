@@ -245,6 +245,8 @@ export const ToolsWebSearchSchema = z
         z.literal("perplexity"),
         z.literal("grok"),
         z.literal("duckduckgo"),
+        z.literal("chromium"),
+        z.literal("bing"),
       ])
       .optional(),
     apiKey: z.string().optional().register(sensitive),

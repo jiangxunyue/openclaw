@@ -18,7 +18,7 @@ import {
   writeCache,
 } from "./web-shared.js";
 
-const SEARCH_PROVIDERS = ["brave", "perplexity", "grok", "duckduckgo"] as const;
+const SEARCH_PROVIDERS = ["brave", "perplexity", "grok", "duckduckgo", "bing", "chromium"] as const;
 const DEFAULT_SEARCH_COUNT = 5;
 const MAX_SEARCH_COUNT = 10;
 
@@ -32,6 +32,8 @@ const OPENROUTER_KEY_PREFIXES = ["sk-or-"];
 
 const XAI_API_ENDPOINT = "https://api.x.ai/v1/responses";
 const DEFAULT_GROK_MODEL = "grok-4-1-fast";
+
+const BING_SEARCH_ENDPOINT = "https://api.bing.microsoft.com/v7.0/search";
 
 const SEARCH_CACHE = new Map<string, CacheEntry<Record<string, unknown>>>();
 const BRAVE_FRESHNESS_SHORTCUTS = new Set(["pd", "pw", "pm", "py"]);
@@ -96,6 +98,19 @@ type BraveSearchResponse = {
   };
 };
 
+type BingSearchResult = {
+  name: string;
+  url: string;
+  snippet: string;
+  displayUrl?: string;
+};
+
+type BingSearchResponse = {
+  webPages?: {
+    value?: BingSearchResult[];
+  };
+};
+
 type PerplexityConfig = {
   apiKey?: string;
   baseUrl?: string;
@@ -108,6 +123,10 @@ type GrokConfig = {
   apiKey?: string;
   model?: string;
   inlineCitations?: boolean;
+};
+
+type BingConfig = {
+  apiKey?: string;
 };
 
 type GrokSearchResponse = {
@@ -235,6 +254,14 @@ function missingSearchKeyPayload(provider: (typeof SEARCH_PROVIDERS)[number]) {
       docs: "https://docs.openclaw.ai/tools/web",
     };
   }
+  if (provider === "bing") {
+    return {
+      error: "missing_bing_api_key",
+      message:
+        "web_search (bing) needs a Microsoft Bing API key. Set BING_API_KEY in the Gateway environment, or configure tools.web.search.bing.apiKey. Get a free key at https://azure.microsoft.com/services/cognitive-services/bing-web-search-api/",
+      docs: "https://docs.openclaw.ai/tools/web",
+    };
+  }
   return {
     error: "missing_brave_api_key",
     message: `web_search needs a Brave Search API key. Run \`${formatCliCommand("openclaw configure --section web")}\` to store it, or set BRAVE_API_KEY in the Gateway environment.`,
@@ -258,6 +285,12 @@ function resolveSearchProvider(search?: WebSearchConfig): (typeof SEARCH_PROVIDE
   }
   if (raw === "duckduckgo" || raw === "ddg") {
     return "duckduckgo";
+  }
+  if (raw === "bing" || raw === "microsoft" || raw === "azure") {
+    return "bing";
+  }
+  if (raw === "chromium" || raw === "headless" || raw === "browser" || raw === "playwright") {
+    return "chromium";
   }
   return "brave";
 }
@@ -398,6 +431,26 @@ function resolveGrokModel(grok?: GrokConfig): string {
 
 function resolveGrokInlineCitations(grok?: GrokConfig): boolean {
   return grok?.inlineCitations === true;
+}
+
+function resolveBingConfig(search?: WebSearchConfig): BingConfig {
+  if (!search || typeof search !== "object") {
+    return {};
+  }
+  const bing = "bing" in search ? search.bing : undefined;
+  if (!bing || typeof bing !== "object") {
+    return {};
+  }
+  return bing as BingConfig;
+}
+
+function resolveBingApiKey(bing?: BingConfig): string | undefined {
+  const fromConfig = normalizeApiKey(bing?.apiKey);
+  if (fromConfig) {
+    return fromConfig;
+  }
+  const fromEnv = normalizeApiKey(process.env.BING_API_KEY);
+  return fromEnv || undefined;
 }
 
 function resolveSearchCount(value: unknown, fallback: number): number {
@@ -686,6 +739,130 @@ async function runDuckDuckGoSearch(params: {
   }
 }
 
+async function runBingSearch(params: {
+  query: string;
+  count: number;
+  apiKey: string;
+  timeoutSeconds: number;
+  country?: string;
+  search_lang?: string;
+}): Promise<DuckDuckGoSearchResult[]> {
+  const url = new URL(BING_SEARCH_ENDPOINT);
+  url.searchParams.set("q", params.query);
+  url.searchParams.set("count", String(params.count));
+  if (params.country) {
+    url.searchParams.set("cc", params.country);
+  }
+  if (params.search_lang) {
+    url.searchParams.set("setlang", params.search_lang);
+  }
+
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      "Ocp-Apim-Subscription-Key": params.apiKey,
+    },
+    signal: withTimeout(undefined, params.timeoutSeconds * 1000),
+  });
+
+  if (!res.ok) {
+    const detailResult = await readResponseText(res, { maxBytes: 64_000 });
+    const detail = detailResult.text;
+    throw new Error(`Bing Search API error (${res.status}): ${detail || res.statusText}`);
+  }
+
+  const data = (await res.json()) as BingSearchResponse;
+  const results = data.webPages?.value ?? [];
+
+  return results.slice(0, params.count).map((entry) => ({
+    title: entry.name,
+    url: entry.url,
+    description: entry.snippet,
+    siteName: resolveSiteName(entry.url),
+  }));
+}
+
+async function runChromiumSearch(params: {
+  query: string;
+  count: number;
+  timeoutSeconds: number;
+}): Promise<DuckDuckGoSearchResult[]> {
+  const { chromium } = await import("playwright-core");
+
+  // Try system chromium first, fall back to bundled
+  let executablePath = "/snap/bin/chromium";
+
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+  });
+
+  try {
+    const page = await browser.newPage();
+
+    // Use DuckDuckGo (more reliable in China)
+    const searchUrl = `https://duckduckgo.com/?q=${encodeURIComponent(params.query)}&num=${params.count}`;
+
+    await page.goto(searchUrl, {
+      waitUntil: "networkidle",
+      timeout: params.timeoutSeconds * 1000,
+    });
+
+    // Wait for results to load
+    await page.waitForSelector("div.g", { timeout: 10000 }).catch(() => {});
+
+    // Extract results
+    const results = await page.evaluate((maxCount) => {
+      const items: Array<{ title: string; url: string; description: string; siteName: string }> =
+        [];
+      const elements = document.querySelectorAll("div.g");
+
+      for (const el of elements) {
+        if (items.length >= maxCount) {
+          break;
+        }
+
+        const titleEl = el.querySelector("h3");
+        const linkEl = el.querySelector("a");
+        const snippetEl = el.querySelector("div.VwiC3b");
+
+        if (titleEl && linkEl) {
+          const url = linkEl.href;
+          // Skip special Google links
+          if (url && !url.startsWith("http")) {
+            continue;
+          }
+          if (url && (url.includes("google.com") || url.includes("youtube.com"))) {
+            // Allow YouTube results
+            if (!url.includes("youtube.com/watch")) {
+              continue;
+            }
+          }
+
+          let siteName = "";
+          try {
+            siteName = new URL(url).hostname;
+          } catch {}
+
+          items.push({
+            title: titleEl.textContent?.trim() || "",
+            url,
+            description: snippetEl?.textContent?.trim() || "",
+            siteName,
+          });
+        }
+      }
+      return items;
+    }, params.count);
+
+    return results;
+  } finally {
+    await browser.close();
+  }
+}
+
 async function runWebSearch(params: {
   query: string;
   count: number;
@@ -707,7 +884,11 @@ async function runWebSearch(params: {
       ? `${params.provider}:${params.query}:${params.count}:${params.country || "default"}:${params.search_lang || "default"}:${params.ui_lang || "default"}:${params.freshness || "default"}`
       : params.provider === "perplexity"
         ? `${params.provider}:${params.query}:${params.perplexityBaseUrl ?? DEFAULT_PERPLEXITY_BASE_URL}:${params.perplexityModel ?? DEFAULT_PERPLEXITY_MODEL}:${params.freshness || "default"}`
-        : `${params.provider}:${params.query}:${params.grokModel ?? DEFAULT_GROK_MODEL}:${String(params.grokInlineCitations ?? false)}`,
+        : params.provider === "bing"
+          ? `${params.provider}:${params.query}:${params.count}:${params.country || "default"}:${params.search_lang || "default"}`
+          : params.provider === "chromium"
+            ? `${params.provider}:${params.query}:${params.count}`
+            : `${params.provider}:${params.query}:${params.grokModel ?? DEFAULT_GROK_MODEL}:${String(params.grokInlineCitations ?? false)}`,
   );
   const cached = readCache(SEARCH_CACHE, cacheKey);
   if (cached) {
@@ -728,6 +909,43 @@ async function runWebSearch(params: {
       count: ddgResults.length,
       tookMs: Date.now() - start,
       results: ddgResults,
+    };
+    writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
+    return payload;
+  }
+
+  if (params.provider === "bing") {
+    const bingResults = await runBingSearch({
+      query: params.query,
+      count: params.count,
+      apiKey: params.apiKey,
+      timeoutSeconds: params.timeoutSeconds,
+      country: params.country,
+      search_lang: params.search_lang,
+    });
+    const payload = {
+      query: params.query,
+      provider: params.provider,
+      count: bingResults.length,
+      tookMs: Date.now() - start,
+      results: bingResults,
+    };
+    writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
+    return payload;
+  }
+
+  if (params.provider === "chromium") {
+    const chromiumResults = await runChromiumSearch({
+      query: params.query,
+      count: params.count,
+      timeoutSeconds: params.timeoutSeconds,
+    });
+    const payload = {
+      query: params.query,
+      provider: params.provider,
+      count: chromiumResults.length,
+      tookMs: Date.now() - start,
+      results: chromiumResults,
     };
     writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
     return payload;
@@ -869,6 +1087,7 @@ export function createWebSearchTool(options?: {
   const provider = resolveSearchProvider(search);
   const perplexityConfig = resolvePerplexityConfig(search);
   const grokConfig = resolveGrokConfig(search);
+  const bingConfig = resolveBingConfig(search);
 
   const description =
     provider === "perplexity"
@@ -877,7 +1096,11 @@ export function createWebSearchTool(options?: {
         ? "Search the web using xAI Grok. Returns AI-synthesized answers with citations from real-time web search."
         : provider === "duckduckgo"
           ? "Search the web using DuckDuckGo. Free search without API key requirements. Returns titles, URLs, and snippets."
-          : "Search the web using Brave Search API. Supports region-specific and localized search via country and language parameters. Returns titles, URLs, and snippets for fast research.";
+          : provider === "bing"
+            ? "Search the web using Microsoft Bing Web Search API. Returns titles, URLs, and snippets for fast research."
+            : provider === "chromium"
+              ? "Search the web using headless Chromium browser. Renders JavaScript and extracts search results from Google. No API key required."
+              : "Search the web using Brave Search API. Supports region-specific and localized search via country and language parameters. Returns titles, URLs, and snippets for fast research.";
 
   return {
     label: "Web Search",
@@ -892,9 +1115,11 @@ export function createWebSearchTool(options?: {
           ? perplexityAuth?.apiKey
           : provider === "grok"
             ? resolveGrokApiKey(grokConfig)
-            : resolveSearchApiKey(search);
+            : provider === "bing"
+              ? resolveBingApiKey(bingConfig)
+              : resolveSearchApiKey(search);
 
-      if (!apiKey && provider !== "duckduckgo") {
+      if (!apiKey && provider !== "duckduckgo" && provider !== "chromium") {
         return jsonResult(missingSearchKeyPayload(provider));
       }
       const params = args as Record<string, unknown>;
@@ -909,6 +1134,13 @@ export function createWebSearchTool(options?: {
         return jsonResult({
           error: "unsupported_freshness",
           message: "freshness is only supported by the Brave and Perplexity web_search providers.",
+          docs: "https://docs.openclaw.ai/tools/web",
+        });
+      }
+      if (rawFreshness && provider === "bing") {
+        return jsonResult({
+          error: "unsupported_freshness",
+          message: "freshness is not supported by the Bing web_search provider.",
           docs: "https://docs.openclaw.ai/tools/web",
         });
       }
